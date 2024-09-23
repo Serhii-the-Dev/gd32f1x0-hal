@@ -11,19 +11,23 @@ use crate::dma::{
 use crate::gpio::Analog;
 use crate::gpio::{gpioa, gpiob, gpioc};
 use crate::pac::{
-    Adc as ADC,
+    Adc as ADC, Interrupt,
     adc::{
         ctl1::{Ctn, Dal, Tsvren, Vbaten},
         sampt0::Spt10,
         sampt1::Spt0,
     },
+    interrupt,
 };
 use crate::rcu::{APB2, Clocks, Enable, Reset};
 use core::{
+    future::poll_fn,
     marker::PhantomData,
     sync::atomic::{self, Ordering},
+    task::Poll,
 };
 use cortex_m::asm::delay;
+use embassy_sync::waitqueue::AtomicWaker;
 use embedded_dma::WriteBuffer;
 #[cfg(feature = "embedded-hal-02")]
 use embedded_hal_02::adc::Channel as _;
@@ -145,6 +149,21 @@ impl From<Align> for Dal {
     }
 }
 
+static WAKER: AtomicWaker = AtomicWaker::new();
+
+#[interrupt]
+fn ADC_CMP() {
+    cortex_m::interrupt::free(|_| {
+        let regs = unsafe { &*ADC::ptr() };
+
+        if regs.stat().read().eoc().is_complete() {
+            regs.ctl0().modify(|_, w| w.eocie().disabled());
+
+            WAKER.wake();
+        }
+    });
+}
+
 impl Adc {
     /// Initialises the ADC.
     ///
@@ -170,6 +189,10 @@ impl Adc {
 
         // Read Vref so that it can be used to scale other readings.
         s.read_vref();
+
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(Interrupt::ADC_CMP);
+        }
 
         s
     }
@@ -473,8 +496,44 @@ impl Adc {
         self.rb.rdata().read().rdata().bits()
     }
 
+    async fn convert_async(&mut self, chan: u8) -> u16 {
+        // Dummy read in case something accidentally triggered
+        // a conversion by writing to CR2 without changing any
+        // of the bits
+        self.rb.rdata().read().rdata().bits();
+
+        self.set_channel_sample_time(chan, self.sample_time);
+        self.set_regular_sequence_channels(&[chan]);
+
+        // Start conversion of regular sequence.
+        self.rb
+            .ctl1()
+            .modify(|_, w| w.swrcst().start().dal().variant(self.align.into()));
+
+        self.rb.ctl0().modify(|_, w| w.eocie().enabled());
+
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+
+            if self.rb.ctl1().read().swrcst().is_started()
+                && self.rb.stat().read().eoc().is_complete()
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        self.rb.rdata().read().rdata().bits()
+    }
+
     pub fn read_channel<PIN: Channel<ADC>>(&mut self, _pin: &PIN) -> u16 {
         self.convert(PIN::channel())
+    }
+
+    pub async fn read_channel_async<PIN: Channel<ADC>>(&mut self, _pin: &PIN) -> u16 {
+        self.convert_async(PIN::channel()).await
     }
 
     /// Configure the ADC to read from the given pin with DMA.
