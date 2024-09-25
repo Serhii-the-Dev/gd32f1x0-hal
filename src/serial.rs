@@ -502,7 +502,7 @@ impl<USART: Deref<Target = usart0::RegisterBlock>> embedded_hal_02::serial::Read
     }
 }
 
-trait UsartConfigExt {
+pub(crate) trait UsartConfigExt {
     type Bus;
 
     fn enable_configure(&self, config: Config, clocks: Clocks, bus: &mut Self::Bus);

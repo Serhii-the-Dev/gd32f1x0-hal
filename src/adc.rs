@@ -153,11 +153,11 @@ static WAKER: AtomicWaker = AtomicWaker::new();
 
 #[interrupt]
 fn ADC_CMP() {
-    cortex_m::interrupt::free(|_| {
-        let regs = unsafe { &*ADC::ptr() };
+    let register = unsafe { &*ADC::ptr() };
 
-        if regs.stat().read().eoc().is_complete() {
-            regs.ctl0().modify(|_, w| w.eocie().disabled());
+    cortex_m::interrupt::free(|_| {
+        if register.stat().read().eoc().is_complete() {
+            register.ctl0().modify(|_, w| w.eocie().disabled());
 
             WAKER.wake();
         }
